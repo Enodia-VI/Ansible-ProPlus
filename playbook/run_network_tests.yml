@@ -1,0 +1,352 @@
+---
+- name: Send selected inventory nodes to the remote test engine
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Convenzione dei nomi gruppo: type_<device_type>,
+    # carrier_<carrier>, cluster_<id>, continent_<slug>, country_<slug>,
+    # site_<slug>, ipv4, ipv6, active, inactive.
+    target_group: "test_debug"
+    test_engine_url: "http://****:8000"
+    requested_by: "ansible"
+
+    suites:
+      - from_ipv4
+      - from_ipv6
+    send_email: false
+
+    # Se true (default), esclude dal target_group i nodi con active:
+    active_only: true
+
+    # Polling dello stato del job dopo la creazione.
+    poll_interval_seconds: 5
+    poll_max_attempts: 60 # 60 * 5s = 5 minuti massimi di attesa
+
+    # Se true, il playbook fallisce quando il job si completa ma con
+    # overall_status diverso da PASS (non solo quando il job stesso
+    # va in errore, che fa già fallire il playbook comunque).
+    fail_on_test_failures: true
+
+    # Se true, salva il report JSON canonico anche localmente sulla macchina Ansible.
+    save_report_locally: true
+    reports_local_dir: "{{ playbook_dir }}/reports"
+
+  pre_tasks:
+    - name: Carica file .env nativamente
+      ansible.builtin.set_fact:
+        env_vars: >-
+          {{ dict(lookup('ansible.builtin.file', playbook_dir + '/.env').splitlines()
+             | reject('match', '^\s*#')
+             | reject('equalto', '')
+             | map('split', '=', 1)) }}
+
+    - name: Imposta le singole variabili per i check del playbook
+      ansible.builtin.set_fact:
+        test_engine_token: "{{ env_vars.INVENTORY_PUSH_TOKEN | default('') }}"
+
+  tasks:
+    # Validate configuration
+    - name: Validate target group
+      ansible.builtin.assert:
+        that:
+          - target_group | length > 0
+        fail_msg: "target_group must not be empty"
+
+    - name: Validate test engine URL
+      ansible.builtin.assert:
+        that:
+          - test_engine_url | length > 0
+        fail_msg: "test_engine_url must not be empty"
+
+    - name: Validate internal token
+      ansible.builtin.assert:
+        that:
+          - test_engine_token | length > 0
+        fail_msg: >
+          Environment variable INVENTORY_PUSH_TOKEN is not set.
+
+    # Resolve selected inventory group
+    - name: Get hosts from selected inventory group
+      ansible.builtin.set_fact:
+        selected_hosts_all: >-
+          {{
+            query(
+              'ansible.builtin.inventory_hostnames',
+              target_group
+            )
+          }}
+
+    - name: Ensure selected group contains hosts
+      ansible.builtin.assert:
+        that:
+          - selected_hosts_all | length > 0
+        fail_msg: >-
+          Il gruppo di inventory '{{ target_group }}' non contiene host.
+          Vedi la convenzione dei nomi gruppo in cima a questo file, o
+          nell'header di inventory/generated/network.yml.
+
+    - name: Filter out inactive hosts (unless active_only is false)
+      ansible.builtin.set_fact:
+        selected_hosts: >-
+          {{
+            selected_hosts_all
+            if not (active_only | bool)
+            else selected_hosts_all | select('in', groups['active'] | default([])) | list
+          }}
+
+    - name: Show selected hosts
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Host selezionati: {{ selected_hosts | length }}
+            (esclusi perché inactive: {{ (selected_hosts_all | length) - (selected_hosts | length) }})
+          - "{{ selected_hosts }}"
+
+    - name: Ensure at least one host remains after filtering
+      ansible.builtin.assert:
+        that:
+          - selected_hosts | length > 0
+        fail_msg: >-
+          Tutti gli host del gruppo '{{ target_group }}' risultano
+          inactive. Imposta active_only=false per includerli comunque.
+
+    # Build test targets
+    - name: Initialize target list
+      ansible.builtin.set_fact:
+        test_targets: []
+
+    - name: Build target objects
+      ansible.builtin.set_fact:
+        test_targets: >-
+          {{
+            test_targets
+            + [
+                {
+                  'hostname': item,
+                  'node_id': hostvars[item].node_id,
+                  'ipv4': hostvars[item].ipv4,
+                  'ipv6': hostvars[item].ipv6,
+                  'continent': hostvars[item].continent,
+                  'country': hostvars[item].country,
+                  'city': hostvars[item].city,
+                  'site': hostvars[item].site,
+                  'cluster_id': hostvars[item].cluster_id,
+                  'cluster_name': hostvars[item].cluster_name,
+                  'carrier': hostvars[item].carrier,
+                  'device_type': hostvars[item].device_type,
+                  'active': hostvars[item].active
+                }
+              ]
+          }}
+      loop: "{{ selected_hosts }}"
+
+    # Display generated payload data
+    - name: Show generated test targets
+      ansible.builtin.debug:
+        var: test_targets
+
+    # =========================================================================
+    # Build final API request
+    # =========================================================================
+
+    - name: Build test run request
+      ansible.builtin.set_fact:
+        test_run_request:
+          targets: "{{ test_targets }}"
+          suites: "{{ suites }}"
+          requested_by: "{{ requested_by }}"
+          send_email: "{{ send_email }}"
+
+    - name: Show test run request
+      ansible.builtin.debug:
+        var: test_run_request
+
+    # =========================================================================
+    # Send request to remote test engine
+    # =========================================================================
+
+    - name: Create remote test job
+      ansible.builtin.uri:
+        url: "{{ test_engine_url }}/api/internal/test-runs"
+        method: POST
+
+        headers:
+          Accept: "application/json"
+          Content-Type: "application/json"
+          X-Internal-Token: "{{ test_engine_token }}"
+
+        body_format: json
+        body: "{{ test_run_request }}"
+
+        status_code:
+          - 202
+
+        return_content: true
+
+        timeout: 15
+
+      register: test_job_response
+
+    # =========================================================================
+    # Store returned job information
+    # =========================================================================
+
+    - name: Store job ID
+      ansible.builtin.set_fact:
+        job_id: "{{ test_job_response.json.job_id }}"
+
+    - name: Store job status
+      ansible.builtin.set_fact:
+        job_status: "{{ test_job_response.json.status }}"
+
+    # =========================================================================
+    # Show result
+    # =========================================================================
+
+    - name: Show created job
+      ansible.builtin.debug:
+        msg:
+          - "Remote test job created."
+          - "Job ID: {{ job_id }}"
+          - "Status: {{ job_status }}"
+          - "Targets: {{ test_targets | length }}"
+          - "Suites: {{ suites | join(', ') }}"
+
+    # =========================================================================
+    # Poll the job until it finishes (completed or failed)
+    # =========================================================================
+
+    - name: Inform about polling
+      ansible.builtin.debug:
+        msg: >-
+          In attesa del completamento del job {{ job_id }}
+          (fino a un massimo di {{ (poll_max_attempts | int) * (poll_interval_seconds | int) }} secondi)...
+
+    - name: Poll remote job status until completed or failed
+      ansible.builtin.uri:
+        url: "{{ test_engine_url }}/api/internal/test-runs/{{ job_id }}"
+        method: GET
+
+        headers:
+          Accept: "application/json"
+          X-Internal-Token: "{{ test_engine_token }}"
+
+        status_code:
+          - 200
+
+        return_content: true
+
+        timeout: 15
+
+      register: job_poll_response
+      until: job_poll_response.json.status in ['completed', 'failed']
+      retries: "{{ poll_max_attempts }}"
+      delay: "{{ poll_interval_seconds }}"
+
+    - name: Store final job status and report
+      ansible.builtin.set_fact:
+        final_job_status: "{{ job_poll_response.json.status }}"
+        final_job_report: "{{ job_poll_response.json.report | default({}) }}"
+        final_report_urls: "{{ job_poll_response.json.report_urls | default({}) }}"
+
+    # =========================================================================
+    # Fallisce il job se crash avviene: Configurazione
+    # invalida, suite inesistente, o un bug del motore finiscono
+    # qui con status 'failed' e un campo 'error' testuale.
+    # =========================================================================
+
+    - name: Fail the playbook if the remote job crashed
+      ansible.builtin.fail:
+        msg: >-
+          Il test job {{ job_id }} è terminato con status 'failed':
+          {{ job_poll_response.json.error | default('nessun dettaglio disponibile') }}
+      when: final_job_status == 'failed'
+
+    # =========================================================================
+    # Show the outcome
+    # =========================================================================
+
+    - name: Show test summary
+      ansible.builtin.debug:
+        msg:
+          - "Job {{ job_id }} — stato complessivo: {{ final_job_report.job.overall_status | default('N/D') }}"
+          - >-
+            Target: {{ final_job_report.summary.targets.total | default('?') }} totali,
+            {{ final_job_report.summary.targets.failed | default('?') }} falliti,
+            {{ final_job_report.summary.targets.errors | default('?') }} in errore
+          - >-
+            Test: {{ final_job_report.summary.tests.passed | default('?') }} PASS,
+            {{ final_job_report.summary.tests.failed | default('?') }} FAIL,
+            {{ final_job_report.summary.tests.errors | default('?') }} ERROR,
+            {{ final_job_report.summary.tests.skipped | default('?') }} SKIPPED
+            (skipped = suite non applicabile al target, es. IPv6 assente — non è un errore)
+          - "Problemi critici: {{ final_job_report.summary.critical.issues | default('?') }}"
+          - "Report JSON: {{ test_engine_url }}{{ final_report_urls.json | default('N/D') }}"
+          - "Report TXT : {{ test_engine_url }}{{ final_report_urls.txt | default('N/D') }}"
+          - "Report HTML: {{ test_engine_url }}{{ final_report_urls.html | default('N/D') }}"
+
+    - name: Show failing tests
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.hostname }} / {{ item.suite }} / {{ item.test_id }}
+          -> {{ item.status }}{{ ' [CRITICAL]' if item.critical else '' }}: {{ item.summary }}
+      loop: "{{ final_job_report.failures | default([]) }}"
+      loop_control:
+        label: "{{ item.hostname }}/{{ item.test_id }}"
+
+    # =========================================================================
+    # Retrieve and save the TXT report locally
+    # =========================================================================
+
+    - name: Ensure local reports directory exists
+      ansible.builtin.file:
+        path: "{{ reports_local_dir }}"
+        state: directory
+        mode: "0755"
+      when: save_report_locally | bool
+
+    - name: Fetch TXT report from remote test engine
+      ansible.builtin.uri:
+        url: "{{ test_engine_url }}{{ final_report_urls.txt }}"
+        method: GET
+        headers:
+          X-Internal-Token: "{{ test_engine_token }}"
+        return_content: true
+      register: txt_report_response
+      when:
+        - save_report_locally | bool
+        - final_report_urls.txt is defined
+
+    - name: Save report.txt locally
+      ansible.builtin.copy:
+        content: "{{ txt_report_response.content }}"
+        dest: "{{ reports_local_dir }}/{{ job_id }}.txt"
+      when: save_report_locally | bool
+
+    # =========================================================================
+    # Fail the playbook if the tests themselves found problems.
+    # qui il job si è completato
+    # regolarmente, ma uno o più test non sono passati.
+    # =========================================================================
+
+    - name: Fail the playbook if the overall test status is not PASS
+      ansible.builtin.fail:
+        msg: >-
+          Il job {{ job_id }} si è completato ma con overall_status
+          '{{ final_job_report.job.overall_status }}' (atteso PASS).
+          Vedi il report per i dettagli:
+          {{ test_engine_url }}{{ final_report_urls.html | default('') }}
+      when:
+        - fail_on_test_failures | bool
+        - final_job_report.job.overall_status is defined
+        - final_job_report.job.overall_status != 'PASS'
+
+    # =========================================================================
+    # MOSTRA OUTPUT A VIDEO FINALE
+    # =========================================================================
+
+    - name: Mostra il contenuto del report a video (TXT)
+      ansible.builtin.debug:
+        msg: "{{ txt_report_response.content.split('\n') }}"
+      when: save_report_locally | bool
